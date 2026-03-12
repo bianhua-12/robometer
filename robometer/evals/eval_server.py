@@ -188,11 +188,13 @@ def process_batch_helper(
     use_frame_steps: bool = False,
 ) -> Dict[str, Any]:
     """Synchronous batch processing on specific GPU."""
+    total_start = time.perf_counter()
     if not batch_data:
         raise ValueError("No samples found in batch data")
 
     logger.debug(f"[job {job_id}] Processing {len(batch_data)} samples on device {device}")
 
+    sample_parse_start = time.perf_counter()
     input_samples: List[Any] = []
     for sample in batch_data:
         if isinstance(sample, (PreferenceSample, ProgressSample)):
@@ -207,12 +209,15 @@ def process_batch_helper(
                 raise ValueError(f"Unsupported sample_type: {sample_type}")
         else:
             raise ValueError(f"Unsupported sample object type: {type(sample)}")
+    sample_parse_s = time.perf_counter() - sample_parse_start
 
     # Handle frame steps for progress samples - expand into sub-samples, each subsampled to 4 frames
     # so they can be batched together (all same size)
     NUM_SUBSAMPLED_FRAMES = 4
 
+    frame_step_expand_s = 0.0
     if use_frame_steps:
+        frame_step_start = time.perf_counter()
         expanded_samples = []
         sample_frame_counts = []  # Track how many sub-samples each original sample generates
 
@@ -268,21 +273,26 @@ def process_batch_helper(
                 sample_frame_counts.append(1)
 
         input_samples = expanded_samples
+        frame_step_expand_s = time.perf_counter() - frame_step_start
         logger.debug(
             f"[job {job_id}] Expanded {len(sample_frame_counts)} samples into {len(input_samples)} sub-samples with frame steps (each subsampled to {NUM_SUBSAMPLED_FRAMES} frames)"
         )
     else:
         sample_frame_counts = None
 
+    collate_start = time.perf_counter()
     batch_inputs = batch_collator(input_samples)
+    collate_s = time.perf_counter() - collate_start
 
     # Move inputs to the correct GPU
+    move_to_device_start = time.perf_counter()
     for key, value in batch_inputs["preference_inputs"].items():
         if isinstance(value, torch.Tensor):
             batch_inputs["preference_inputs"][key] = value.to(device)
     for key, value in batch_inputs["progress_inputs"].items():
         if isinstance(value, torch.Tensor):
             batch_inputs["progress_inputs"][key] = value.to(device)
+    move_to_device_s = time.perf_counter() - move_to_device_start
     outputs_preference = None
     outputs_progress = None
     outputs_success = None
@@ -291,7 +301,12 @@ def process_batch_helper(
     num_progress = batch_inputs.get("num_progress", 0)
     logger.debug(f"[job {job_id}] Batch counts — preference: {num_preferences} progress: {num_progress}")
 
+    preference_forward_s = 0.0
+    progress_forward_s = 0.0
+    aggregate_s = 0.0
+
     if num_preferences > 0:
+        preference_forward_start = time.perf_counter()
         outputs_preference = compute_batch_outputs(
             model,
             tokenizer,
@@ -300,8 +315,10 @@ def process_batch_helper(
             is_discrete_mode=is_discrete_mode,
             num_bins=num_bins,
         )
+        preference_forward_s = time.perf_counter() - preference_forward_start
 
     if num_progress > 0:
+        progress_forward_start = time.perf_counter()
         outputs_progress = compute_batch_outputs(
             model,
             tokenizer,
@@ -310,15 +327,30 @@ def process_batch_helper(
             is_discrete_mode=is_discrete_mode,
             num_bins=num_bins,
         )
+        progress_forward_s = time.perf_counter() - progress_forward_start
 
         if "outputs_success" in outputs_progress:
             outputs_success = outputs_progress.pop("outputs_success")
 
         # Aggregate frame-step predictions back into full sequences
         if use_frame_steps and sample_frame_counts is not None:
+            aggregate_start = time.perf_counter()
             outputs_progress = aggregate_frame_step_predictions(outputs_progress, sample_frame_counts, outputs_success)
             if outputs_success is not None:
                 outputs_success = outputs_progress.pop("outputs_success", None)
+            aggregate_s = time.perf_counter() - aggregate_start
+
+    logger.debug(
+        f"[job {job_id}] timing_s "
+        f"sample_parse={sample_parse_s:.3f} "
+        f"frame_step_expand={frame_step_expand_s:.3f} "
+        f"collate={collate_s:.3f} "
+        f"move_to_device={move_to_device_s:.3f} "
+        f"preference_forward={preference_forward_s:.3f} "
+        f"progress_forward={progress_forward_s:.3f} "
+        f"aggregate={aggregate_s:.3f} "
+        f"total={time.perf_counter() - total_start:.3f}"
+    )
 
     return {
         "outputs_preference": outputs_preference,

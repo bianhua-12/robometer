@@ -1,7 +1,10 @@
-__pycache__/*
-.venv-robodopamine/*
-outputs/*
-unsloth_compiled_cache/*
 *.pyc
+__pycache__/
+.venv-robodopamine/*
+uv.lock
+AGENTS.md
+*.log
+outputs/
+unsloth_compiled_cache/
 venv_robodopamine.txt
 baseline_eval_output/*
